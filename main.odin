@@ -43,15 +43,22 @@ handle_file :: proc(file_name: string) {
     ctx.files[file_name] = string(data)
     ctx.current_file = file_name
 
- debugln("file size:", len(data));
+    debugln("file size:", len(data));
 
     tokens := lex_file(data)
     defer delete(tokens)
 
     debugln("PARSING FILE");
     ast := parse_tokens(string(data), tokens[:])
-    debugln("RESOLVINF SYMBOLS");
-    decs := resolve_module_ast(&ast)
+
+    debugln("RESOLVING SYMBOLS");
+    // builtin_names() reads off interpreter.odin's builtins_registry
+    // -- "print", "len", "type_of", and anything else registered
+    // there -- so this list never needs editing by hand here again.
+    decs := resolve_module_ast(&ast, builtin_names())
+
+    debugln("RUNNING");
+    run_program(&ast, decs)
 }
 
 

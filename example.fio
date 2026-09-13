@@ -1,19 +1,11 @@
-q1 = "Hello, World!"
-a = 4
-
-b = 10;
-
-c = [1, 2, 34];
-
-
-d = { a= 10, b=[1, 2], c={a=1}};
-
-e = () { print(1) };
-f = (a, b=1) {
-    c = a + b;
-    e();
-    return c;
+fn = (a) {
+    return a(3);
 }
-g = f( () => 1+2*b, b = 2);
-print = (f) => {}
-print(a)
+smth = () {
+
+    b = 3;
+    f = (a) => b + 3*b;
+    print(fn(f))
+
+}
+smth()

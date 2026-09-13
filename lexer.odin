@@ -21,7 +21,6 @@ TokenKind :: enum {
 }
 Keyword :: enum {
     Invalid,
-    Fn,
     Return,
     If, Else,
     While,
@@ -134,18 +133,6 @@ lex_file :: proc(buf: []byte) -> [dynamic]Token {
             ident := cast(string)buf[start:i];
             if ident == "_" {
                 panic("invalid ident \"_\".");
-            }else if ident == "fn" {
-                append(&tokens, Token{
-                    span = Span{start, i},
-                    kind = .Keyword,
-                    kw   = .Fn,
-                })
-            }else if ident == "struct" {
-                append(&tokens, Token{
-                    span = Span{start, i},
-                    kind = .Keyword,
-                    kw   = .Struct,
-                })
             }else if ident == "return" {
                 append(&tokens, Token{
                     span = Span{start, i},
@@ -169,12 +156,6 @@ lex_file :: proc(buf: []byte) -> [dynamic]Token {
                     span = Span{start, i},
                     kind = .Keyword,
                     kw   = .While,
-                })
-            }else if ident == "extern" {
-                append(&tokens, Token{
-                    span = Span{start, i},
-                    kind = .Keyword,
-                    kw   = .Extern,
                 })
             }else if ident == "break" {
                 append(&tokens, Token{
@@ -200,28 +181,10 @@ lex_file :: proc(buf: []byte) -> [dynamic]Token {
                     kind = .Cast,
                     kw   = .Invalid,
                 })
-            }else if ident == "transmute" {
-                append(&tokens, Token{
-                    span = Span{start, i},
-                    kind = .Transmute,
-                    kw   = .Invalid,
-                })
             }else if ident == "len" {
                 append(&tokens, Token{
                     span = Span{start, i},
                     kind = .Len,
-                    kw   = .Invalid,
-                })
-            }else if ident == "sizeof" {
-                append(&tokens, Token{
-                    span = Span{start, i},
-                    kind = .Sizeof,
-                    kw   = .Invalid,
-                })
-            }else if ident == "any" {
-                append(&tokens, Token{
-                    span = Span{start, i},
-                    kind = .Any,
                     kw   = .Invalid,
                 })
             }else if ident == "true" {

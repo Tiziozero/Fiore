@@ -137,11 +137,18 @@ Node_Param :: struct {
 // Empty for a function that doesn't create any closures over its own
 // locals. Codegen uses this to know what a closure object allocated
 // for THIS function needs to carry pointers to.
+//
+// num_slots is also filled in by the resolver (resolve_function),
+// once every name in this function's body (including nested blocks,
+// which share this function's slot counter) has been hoisted: it's
+// the total count of local-variable slots this function's activation
+// needs, i.e. what the interpreter/codegen sizes each call frame to.
 Node_Function :: struct {
-    params:   []Node_Param,
-    body:     ^Node, // .Block node, or an expression node if is_arrow
-    is_arrow: bool,
-    captures: []^Symbol,
+    params:    []Node_Param,
+    body:      ^Node, // .Block node, or an expression node if is_arrow
+    is_arrow:  bool,
+    captures:  []^Symbol,
+    num_slots: int,
 }
 
 Node_Array :: struct {

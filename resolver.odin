@@ -302,18 +302,52 @@ resolve_assign_target :: proc(r: ^Resolver, node: ^Node) -> ^Symbol {
 // AST traversal
 // ---------------------------------------------------------------------
 
-ModuleDecs :: struct {}
-resolve_module_ast :: proc(ast: ^AST) -> ModuleDecs {
+// num_slots mirrors Node_Function.num_slots but for the implicit
+// top-level "function" -- module code isn't itself a Node_Function,
+// so there's nowhere else to hang this number. The interpreter needs
+// it to size the top-level Frame.
+//
+// builtins hands the interpreter the Symbols for whatever names in
+// builtin_names got predeclared here before user code was resolved,
+// so it can find the right Cell to install each builtin's runtime
+// value into -- see run_program in interpreter.odin. The resolver
+// deliberately doesn't know what any of these names DO (that's
+// interpreter.odin's builtins_registry) -- it just reserves the
+// names, the same way it would for anything else predeclared ahead
+// of user code.
+ModuleDecs :: struct {
+    num_slots: int,
+    builtins:  map[string]^Symbol,
+}
+
+resolve_module_ast :: proc(ast: ^AST, builtin_names: []string) -> ModuleDecs {
     r := Resolver{}
     enter_function_scope(&r, nil) // implicit top-level "function"
+
+    // Builtins are predeclared exactly like any hoisted name, just
+    // before user code gets a chance to declare anything -- so
+    // ordinary lookup_symbol calls find e.g. "print" like any other
+    // global, and shadowing one with "print = ..." works the same way
+    // shadowing any other predeclared name would.
+    builtins := make(map[string]^Symbol)
+    for name in builtin_names {
+        sym := declare_symbol(&r, name)
+        sym.defined = true
+        builtins[name] = sym
+    }
+
     for stmt in ast.nodes {
         predeclare_names(&r, stmt)
     }
     for stmt in ast.nodes {
         resolve_stmt(&r, stmt)
     }
+
+    fs := r.current.function_scope
+    num_slots := fs.next_slot^
+
     exit_scope(&r)
-    return {}
+    return ModuleDecs{num_slots = num_slots, builtins = builtins}
 }
 
 resolve_stmt :: proc(r: ^Resolver, node: ^Node) {
@@ -461,6 +495,13 @@ resolve_function :: proc(r: ^Resolver, node: ^Node) {
         }
     }
     f.captures = captures[:]
+
+    // How many local slots this activation needs, total -- includes
+    // params, every hoisted name in the body, and everything hoisted
+    // in nested blocks (they share this function's slot counter, see
+    // Scope.next_slot). The interpreter sizes each call's Frame.slots
+    // to this.
+    f.num_slots = fn_scope.next_slot^
 
     exit_scope(r)
 }
