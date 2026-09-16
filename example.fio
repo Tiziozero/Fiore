@@ -9,3 +9,5 @@ smth = () {
 
 }
 smth()
+a = {x=123};
+print(a);

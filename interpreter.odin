@@ -2,6 +2,7 @@ package main
 
 import "core:fmt"
 import "core:math"
+import "core:strings"
 
 // ---------------------------------------------------------------------
 // Runtime values
@@ -233,23 +234,39 @@ value_to_string :: proc(v: Value) -> string {
     switch val in v {
     case f64:
         return fmt.tprintf("%v", val)
+
     case string:
         return val
+
     case bool:
         return val ? "true" : "false"
+
     case ^Value_Array:
-        // NOTE: this just uses the default %v formatting for the
-        // element slice, so nested arrays/objects/closures inside it
-        // won't go through value_to_string recursively yet -- fine
-        // for a first pass, worth revisiting once you care about
-        // pretty-printing nested structures.
-        return fmt.tprintf("%v", val.elements[:])
+        parts: [dynamic]string
+        defer delete_dynamic_array(parts)
+
+        for elem in val.elements {
+            append(&parts, value_to_string(elem))
+        }
+
+        return fmt.tprintf("[%s]", strings.join(parts[:], ", "))
+
     case ^Value_Object:
-        return "<object>" // TODO: pretty-print fields
+        parts: [dynamic]string
+        defer delete_dynamic_array(parts)
+
+        for name, field in val.fields {
+            append(&parts, fmt.tprintf("%s = %s", name, value_to_string(field)))
+        }
+
+        return fmt.tprintf("{{ %s }", strings.join(parts[:], ", "))
+
     case ^Closure:
         return "<function>"
+
     case ^Builtin:
         return fmt.tprintf("<builtin %s>", val.name)
+
     case:
         return "nil"
     }
