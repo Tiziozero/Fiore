@@ -1,7 +1,10 @@
 package main
 
+import "core:encoding/json"
 import "core:fmt"
 import "core:math"
+import "core:os"
+import "core:slice"
 import "core:strings"
 
 // ---------------------------------------------------------------------
@@ -93,6 +96,11 @@ alloc_frame :: proc(fn_node: ^Node, num_slots: int, parent: ^Frame) -> ^Frame {
 // nil for a module-level global, which matches the implicit top
 // frame's fn_node (also nil) -- so globals just fall out of the same
 // walk instead of needing a separate case.
+//
+// Every module has its own top frame with parent == nil, so this walk
+// can never cross from one module's frames into another's: an imported
+// name is found because the importer's slot was aliased to the
+// exporter's Cell (see run_program), not by searching across modules.
 find_cell :: proc(from: ^Frame, sym: ^Symbol) -> ^Cell {
     f := from
     for f != nil {
@@ -132,20 +140,16 @@ Exec_Result :: struct {
 // change -- builtin_names() feeds the resolver so the name resolves
 // like any other global, and run_program below wires this same list
 // into runtime Cells.
-// interpreter.odin
-
-builtin_sqrt :: proc(args: []Value) -> Value {
-    if len(args) != 1 {
-        panicf("sqrt: expected 1 argument, got %d", len(args))
-    }
-    return math.sqrt(as_number(args[0]))
-}
-
 builtins_registry := []Builtin_Def{
-    {"print",   builtin_print},
-    {"len",     builtin_len},
-    {"type_of", builtin_type_of},
-    {"sqrt",    builtin_sqrt}, // <- just add the line
+    {"exec",          builtin_exec},
+    {"print",         builtin_print},
+    {"len",           builtin_len},
+    {"type_of",       builtin_type_of},
+    {"sqrt",          builtin_sqrt},
+    {"string",        builtin_string},
+    {"json_parse",    builtin_json_parse},
+    {"json_marshal",  builtin_json_marshal},
+    {"json_marshall", builtin_json_marshal}, // alias for the other spelling
 }
 
 Builtin_Def :: struct {
@@ -161,6 +165,74 @@ builtin_names :: proc() -> []string {
         append(&names, def.name)
     }
     return names[:]
+}
+
+builtin_sqrt :: proc(args: []Value) -> Value {
+    if len(args) != 1 {
+        panicf("sqrt: expected 1 argument, got %d", len(args))
+    }
+    return math.sqrt(as_number(args[0]))
+}
+
+// With one argument, the command is passed through the platform shell,
+// preserving pipes, redirects and quoting.
+// With multiple arguments, the first is the executable and the rest are
+// passed as literal arguments.
+builtin_exec :: proc(args: []Value) -> Value {
+    if len(args) < 1 {
+        panicf("exec: expected at least 1 argument, got 0")
+    }
+
+    for arg, i in args {
+        if _, ok := arg.(string); !ok {
+            panicf("exec: argument %d must be a string, got %s", i, value_to_string(arg))
+        }
+    }
+
+    shell_cmd: []string
+
+    if len(args) == 1 {
+        cmd := args[0].(string)
+
+        when ODIN_OS == .Windows {
+            shell_cmd = []string{"cmd", "/c", cmd}
+        } else {
+            shell_cmd = []string{"/bin/sh", "-c", cmd}
+        }
+    } else {
+        shell_cmd = make([]string, len(args))
+
+        for arg, i in args {
+            shell_cmd[i] = arg.(string)
+        }
+    }
+
+    state, stdout, stderr, err := os.process_exec(
+        {command = shell_cmd},
+        context.allocator,
+    )
+
+    if err != nil {
+        panicf("exec: failed to run \"%s\": %v", shell_cmd[0], err)
+    }
+
+    fields := make(map[string]Value)
+    fields["stdout"] = string(stdout)
+    fields["stderr"] = string(stderr)
+    fields["code"]   = f64(state.exit_code)
+
+    return new_clone(Value_Object{fields = fields})
+}
+
+// string(x) -> converts any value to its string form.
+builtin_string :: proc(args: []Value) -> Value {
+    if len(args) != 1 {
+        panicf("string: expected 1 argument, got %d", len(args))
+    }
+    if s, ok := args[0].(string); ok {
+        return s
+    }
+    return strings.clone(value_to_string(args[0]))
 }
 
 builtin_print :: proc(args: []Value) -> Value {
@@ -181,8 +253,10 @@ builtin_len :: proc(args: []Value) -> Value {
         return f64(len(v))
     case ^Value_Array:
         return f64(len(v.elements))
+    case ^Value_Object:
+        return f64(len(v.fields))
     case:
-        panicf("len: expected a string or array, got %s", value_to_string(args[0]))
+        panicf("len: expected a string, array or object, got %s", value_to_string(args[0]))
     }
     return nil
 }
@@ -203,15 +277,184 @@ builtin_type_of :: proc(args: []Value) -> Value {
 }
 
 // ---------------------------------------------------------------------
+// JSON
+// ---------------------------------------------------------------------
+
+// json_parse("{\"a\": [1, 2, {\"b\": null}]}") -> object / array / number /
+// string / bool / nil. All JSON numbers become f64. Strict JSON (no
+// comments, no trailing commas).
+builtin_json_parse :: proc(args: []Value) -> Value {
+    if len(args) != 1 {
+        panicf("json_parse: expected 1 argument, got %d", len(args))
+    }
+    text, ok := args[0].(string)
+    if !ok {
+        panicf("json_parse: expected a string, got %s", value_to_string(args[0]))
+    }
+
+    jv, err := json.parse(transmute([]byte)text, .JSON)
+    if err != .None {
+        panicf("json_parse: invalid JSON (%v)", err)
+    }
+    return json_to_value(jv)
+}
+
+json_to_value :: proc(jv: json.Value) -> Value {
+    switch v in jv {
+    case json.Null:
+        return nil
+    case json.Integer:
+        return f64(v)
+    case json.Float:
+        return f64(v)
+    case json.Boolean:
+        return bool(v)
+    case json.String:
+        return string(v)
+    case json.Array:
+        elems := make([dynamic]Value)
+        for e in v {
+            append(&elems, json_to_value(e))
+        }
+        return new_clone(Value_Array{elements = elems})
+    case json.Object:
+        fields := make(map[string]Value)
+        for k, e in v {
+            fields[k] = json_to_value(e)
+        }
+        return new_clone(Value_Object{fields = fields})
+    case:
+        return nil
+    }
+}
+
+// json_marshal(value)        -> compact JSON string
+// json_marshal(value, true)  -> pretty-printed (2-space indent)
+// Object keys are sorted so the output is deterministic. NaN/Infinity
+// become null; functions can't be serialized and panic.
+builtin_json_marshal :: proc(args: []Value) -> Value {
+    if len(args) < 1 || len(args) > 2 {
+        panicf("json_marshal: expected 1 or 2 arguments, got %d", len(args))
+    }
+    pretty := len(args) == 2 && is_truthy(args[1])
+
+    b := strings.builder_make()
+    json_write(&b, args[0], pretty, 0)
+    return strings.to_string(b)
+}
+
+json_newline :: proc(b: ^strings.Builder, pretty: bool, depth: int) {
+    if !pretty { return }
+    strings.write_byte(b, '\n')
+    for _ in 0 ..< depth {
+        strings.write_string(b, "  ")
+    }
+}
+
+json_escape :: proc(b: ^strings.Builder, s: string) {
+    strings.write_byte(b, '"')
+    for c in transmute([]byte)s {
+        switch c {
+        case '"':  strings.write_string(b, "\\\"")
+        case '\\': strings.write_string(b, "\\\\")
+        case '\n': strings.write_string(b, "\\n")
+        case '\r': strings.write_string(b, "\\r")
+        case '\t': strings.write_string(b, "\\t")
+        case:
+            if c < 0x20 {
+                fmt.sbprintf(b, "\\u%04x", int(c))
+            } else {
+                strings.write_byte(b, c) // bytes >= 0x80 pass through, keeping UTF-8 intact
+            }
+        }
+    }
+    strings.write_byte(b, '"')
+}
+
+json_write :: proc(b: ^strings.Builder, v: Value, pretty: bool, depth: int) {
+    if depth > 200 {
+        panicf("json_marshal: value nested too deeply (cyclic structure?)")
+    }
+
+    switch val in v {
+    case f64:
+        if math.is_nan(val) || math.is_inf(val) {
+            strings.write_string(b, "null")
+        } else if val == math.floor(val) && abs(val) < 1e15 {
+            fmt.sbprintf(b, "%d", i64(val))
+        } else {
+            fmt.sbprintf(b, "%v", val)
+        }
+
+    case string:
+        json_escape(b, val)
+
+    case bool:
+        strings.write_string(b, "true" if val else "false")
+
+    case ^Value_Array:
+        if len(val.elements) == 0 {
+            strings.write_string(b, "[]")
+            return
+        }
+        strings.write_byte(b, '[')
+        for e, i in val.elements {
+            if i > 0 { strings.write_byte(b, ',') }
+            json_newline(b, pretty, depth + 1)
+            json_write(b, e, pretty, depth + 1)
+        }
+        json_newline(b, pretty, depth)
+        strings.write_byte(b, ']')
+
+    case ^Value_Object:
+        if len(val.fields) == 0 {
+            strings.write_string(b, "{}")
+            return
+        }
+        keys := make([dynamic]string, context.temp_allocator)
+        for k in val.fields {
+            append(&keys, k)
+        }
+        slice.sort(keys[:])
+
+        strings.write_byte(b, '{')
+        for k, i in keys {
+            if i > 0 { strings.write_byte(b, ',') }
+            json_newline(b, pretty, depth + 1)
+            json_escape(b, k)
+            strings.write_byte(b, ':')
+            if pretty { strings.write_byte(b, ' ') }
+            json_write(b, val.fields[k], pretty, depth + 1)
+        }
+        json_newline(b, pretty, depth)
+        strings.write_byte(b, '}')
+
+    case ^Closure, ^Builtin:
+        panicf("json_marshal: cannot serialize a function")
+
+    case:
+        strings.write_string(b, "null")
+    }
+}
+
+// ---------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------
 
-// Typical wiring once you have a lexer:
-//   tokens := lex(source)
-//   ast := parse_tokens(source, tokens)
-//   decs := resolve_module_ast(&ast, builtin_names())
-//   run_program(&ast, decs)
-run_program :: proc(ast: ^AST, decs: ModuleDecs) {
+// Runs one module's top level and returns its top-level Frame (the
+// caller -- run_module in modules.odin -- stores it so importers can
+// find this module's exported Cells).
+//
+// Imports run first, before any statement of this module's own body:
+// each imported module is executed (once, however many places import
+// it), then this module's slot for each imported name is pointed at
+// the exporting module's Cell. Both sides share that Cell, so these
+// are live bindings -- if the exporter reassigns the variable later,
+// importers see the new value.
+//
+// Typical wiring once you have a lexer: see handle_file in main.odin
+// (load_module_source, then run_module).
+run_program :: proc(ast: ^AST, decs: ModuleDecs) -> ^Frame {
     top := alloc_frame(nil, decs.num_slots, nil)
     interp := Interp{frame = top}
 
@@ -223,11 +466,24 @@ run_program :: proc(ast: ^AST, decs: ModuleDecs) {
     }
 
     for stmt in ast.nodes {
+        if stmt.kind != .Import {
+            continue
+        }
+        imp := &stmt.data.(Node_Import)
+        run_module(imp.module)
+        for n in imp.names {
+            top.slots[n.resolved.slot] = find_cell(imp.module.frame, n.exported)
+        }
+    }
+
+    for stmt in ast.nodes {
         res := exec_stmt(&interp, stmt)
         if res.did_return {
             break // a bare top-level `return` just ends the program
         }
     }
+
+    return top
 }
 
 value_to_string :: proc(v: Value) -> string {
@@ -249,7 +505,7 @@ value_to_string :: proc(v: Value) -> string {
             append(&parts, value_to_string(elem))
         }
 
-        return fmt.tprintf("[%s]", strings.join(parts[:], ", "))
+        return fmt.tprintf("[%s]", strings.join(parts[:], ", ", context.temp_allocator))
 
     case ^Value_Object:
         parts: [dynamic]string
@@ -259,7 +515,10 @@ value_to_string :: proc(v: Value) -> string {
             append(&parts, fmt.tprintf("%s = %s", name, value_to_string(field)))
         }
 
-        return fmt.tprintf("{{ %s }", strings.join(parts[:], ", "))
+        // Built with concatenate rather than a format string so the
+        // literal braces can't be mistaken for format syntax.
+        joined := strings.join(parts[:], ", ", context.temp_allocator)
+        return strings.concatenate({"{ ", joined, " }"}, context.temp_allocator)
 
     case ^Closure:
         return "<function>"
@@ -273,6 +532,108 @@ value_to_string :: proc(v: Value) -> string {
 }
 
 // ---------------------------------------------------------------------
+// Field access and indexing
+// ---------------------------------------------------------------------
+
+// Converts an index Value to an int, requiring a whole number. Range
+// checking is the caller's job (set_index allows idx == len to append).
+index_to_int :: proc(idx: Value, what: string) -> int {
+    n, ok := idx.(f64)
+    if !ok {
+        panicf("%s index must be a number, got %s", what, value_to_string(idx))
+    }
+    i := int(n)
+    if f64(i) != n {
+        panicf("%s index must be a whole number, got %v", what, n)
+    }
+    return i
+}
+
+check_index_range :: proc(i: int, length: int, what: string) {
+    if i < 0 || i >= length {
+        panicf("%s index %d out of range (length %d)", what, i, length)
+    }
+}
+
+// obj.name -- a missing field reads as nil.
+get_field :: proc(obj: Value, name: string) -> Value {
+    #partial switch o in obj {
+    case ^Value_Object:
+        if v, ok := o.fields[name]; ok {
+            return v
+        }
+        return nil
+    case:
+        panicf("cannot read field \"%s\" of %s", name, value_to_string(obj))
+    }
+    return nil
+}
+
+// obj[idx] -- arrays take a number, objects take a string key, strings
+// take a number and return a 1-byte string.
+get_index :: proc(obj: Value, idx: Value) -> Value {
+    #partial switch o in obj {
+    case ^Value_Array:
+        i := index_to_int(idx, "array")
+        check_index_range(i, len(o.elements), "array")
+        return o.elements[i]
+
+    case string:
+        i := index_to_int(idx, "string")
+        check_index_range(i, len(o), "string")
+        return o[i:i + 1]
+
+    case ^Value_Object:
+        key, ok := idx.(string)
+        if !ok {
+            panicf("object key must be a string, got %s", value_to_string(idx))
+        }
+        if v, found := o.fields[key]; found {
+            return v
+        }
+        return nil
+
+    case:
+        panicf("cannot index into %s", value_to_string(obj))
+    }
+    return nil
+}
+
+// obj.name = val
+set_field :: proc(obj: Value, name: string, val: Value) {
+    #partial switch o in obj {
+    case ^Value_Object:
+        o.fields[name] = val
+    case:
+        panicf("cannot set field \"%s\" on %s", name, value_to_string(obj))
+    }
+}
+
+// obj[idx] = val -- on an array, idx == len appends.
+set_index :: proc(obj: Value, idx: Value, val: Value) {
+    #partial switch o in obj {
+    case ^Value_Array:
+        i := index_to_int(idx, "array")
+        if i == len(o.elements) {
+            append(&o.elements, val)
+        } else {
+            check_index_range(i, len(o.elements), "array")
+            o.elements[i] = val
+        }
+
+    case ^Value_Object:
+        key, ok := idx.(string)
+        if !ok {
+            panicf("object key must be a string, got %s", value_to_string(idx))
+        }
+        o.fields[key] = val
+
+    case:
+        panicf("cannot assign into an index of %s", value_to_string(obj))
+    }
+}
+
+// ---------------------------------------------------------------------
 // Statements
 // ---------------------------------------------------------------------
 
@@ -280,17 +641,43 @@ exec_stmt :: proc(interp: ^Interp, node: ^Node) -> Exec_Result {
     #partial switch node.kind {
     case .Assign:
         a := &node.data.(Node_Assign)
-        sym := a.target.data.(Node_Name).resolved
-        cell := find_cell(interp.frame, sym)
 
-        val := eval_expr(interp, a.value)
-        if op, has_op := a.op.?; has_op {
-            // The parser desugars "x += v" only as far as recording
-            // the op alongside the plain value -- do the actual fold
-            // (x = x op v) here, using the CURRENT value of x.
-            val = apply_binop(op, cell.value, val)
+        #partial switch a.target.kind {
+        case .Name:
+            sym := a.target.data.(Node_Name).resolved
+            cell := find_cell(interp.frame, sym)
+
+            val := eval_expr(interp, a.value)
+            if op, has_op := a.op.?; has_op {
+                // The parser desugars "x += v" only as far as recording
+                // the op alongside the plain value -- do the actual fold
+                // (x = x op v) here, using the CURRENT value of x.
+                val = apply_binop(op, cell.value, val)
+            }
+            cell.value = val
+
+        case .Field:
+            t := &a.target.data.(Node_Field)
+            obj := eval_expr(interp, t.object)
+            val := eval_expr(interp, a.value)
+            if op, has_op := a.op.?; has_op {
+                val = apply_binop(op, get_field(obj, t.name), val)
+            }
+            set_field(obj, t.name, val)
+
+        case .Index:
+            t := &a.target.data.(Node_Index)
+            obj := eval_expr(interp, t.object)
+            idx := eval_expr(interp, t.index)
+            val := eval_expr(interp, a.value)
+            if op, has_op := a.op.?; has_op {
+                val = apply_binop(op, get_index(obj, idx), val)
+            }
+            set_index(obj, idx, val)
+
+        case:
+            panicf("exec_stmt: invalid assignment target (kind %v)", a.target.kind)
         }
-        cell.value = val
         return {}
 
     case .Return:
@@ -303,6 +690,11 @@ exec_stmt :: proc(interp: ^Interp, node: ^Node) -> Exec_Result {
 
     case .Block:
         return exec_block(interp, node)
+
+    case .Import:
+        // Already handled before the first statement ran -- see
+        // run_program. Nothing to do at the statement's own position.
+        return {}
 
     case .If:
         f := &node.data.(Node_If)
@@ -407,6 +799,16 @@ eval_expr :: proc(interp: ^Interp, node: ^Node) -> Value {
         }
         return new_clone(Value_Object{fields = fields})
 
+    case .Field:
+        f := &node.data.(Node_Field)
+        return get_field(eval_expr(interp, f.object), f.name)
+
+    case .Index:
+        i := &node.data.(Node_Index)
+        obj := eval_expr(interp, i.object)
+        idx := eval_expr(interp, i.index)
+        return get_index(obj, idx)
+
     case .Function:
         return new_clone(Closure{fn_node = node, env = interp.frame})
 
@@ -423,10 +825,10 @@ apply_binop :: proc(op: BinopKind, l: Value, r: Value) -> Value {
     case .NotEqual:
         return !values_equal(l, r)
     case .Addition:
-        // "+" also does string concatenation when either side is a
-        // string, rather than requiring both to already be strings.
+        // string + string concatenates; if only one side is a string,
+        // the other is converted first ("n = " + 5 -> "n = 5").
         if is_string(l) || is_string(r) {
-            return fmt.tprintf("%s%s", value_to_string(l), value_to_string(r))
+            return strings.concatenate({value_to_string(l), value_to_string(r)})
         }
         return as_number(l) + as_number(r)
     case .Subtraction:

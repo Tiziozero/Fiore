@@ -38,6 +38,10 @@ Symbol :: struct {
     // a closure over storage that will exist by call time, so it's
     // allowed to see a declared-but-not-yet-defined symbol.
     defined:  bool,
+    // True for a name brought in by "import { name } from ...". Its
+    // storage is the exporting module's own cell (the interpreter
+    // aliases the slot), so assigning to it here is an error.
+    imported: bool,
 }
 
 Scope :: struct {
@@ -174,6 +178,10 @@ lookup_symbol :: proc(r: ^Resolver, name: string) -> (sym: ^Symbol, fn_hops: int
 // boundaries: a nested function literal's own locals get predeclared
 // separately, when THAT function's body is resolved.
 //
+// Field / index targets ("a.b = ...", "a[i] = ...") never declare
+// anything -- they mutate an object that must already exist -- so
+// they're skipped here.
+//
 // Two things fall out of hoisting every target up front like this,
 // matching how Python decides local-vs-outer per function:
 //
@@ -275,8 +283,8 @@ resolve_name_ref :: proc(r: ^Resolver, node: ^Node) {
 // always already exist as a LOCAL symbol (hops == 0) by the time we
 // get here -- this just looks it up and marks it defined. The
 // declare_symbol fallback below only matters for shapes
-// predeclare_names doesn't see (e.g. a target that isn't a bare Name,
-// once those exist) and should not normally trigger for plain names.
+// predeclare_names doesn't see and should not normally trigger for
+// plain names.
 //
 // Note this is now intentionally NOT "search outward and mutate
 // whatever's found": predeclaration means a same-named symbol in an
@@ -285,6 +293,9 @@ resolve_name_ref :: proc(r: ^Resolver, node: ^Node) {
 // variable. Want that back later (Lua-style upvalue mutation)? Add an
 // explicit keyword (e.g. "nonlocal x") rather than relying on the
 // generic search.
+//
+// (Mutating THROUGH an outer variable -- "outer.field = 1" -- is fine:
+// that's a read of "outer", handled by resolve_name_ref.)
 resolve_assign_target :: proc(r: ^Resolver, node: ^Node) -> ^Symbol {
     n := &node.data.(Node_Name)
     sym, hops, found := lookup_symbol(r, n.name)
@@ -293,9 +304,64 @@ resolve_assign_target :: proc(r: ^Resolver, node: ^Node) -> ^Symbol {
     } else if hops > 0 {
         sym.captured = true // vestigial for plain Name targets now that predeclare shadows first
     }
+    if sym.imported {
+        highlight_lines(node.pos)
+        panicf("cannot assign to imported name \"%s\"", n.name)
+    }
     sym.defined = true
     n.resolved = sym
     return sym
+}
+
+// ---------------------------------------------------------------------
+// Imports
+// ---------------------------------------------------------------------
+
+// Loads (lex/parse/resolve, recursively) the module an import points
+// at, then declares one local symbol in the importing module per
+// imported name. The local symbol is just a placeholder with its own
+// slot; at runtime the interpreter points that slot at the exporting
+// module's cell, so both modules share storage.
+//
+// If the name is already declared at this level -- a builtin like
+// "print" -- the import takes it over, the same way an ordinary
+// "print = ..." would.
+resolve_import :: proc(r: ^Resolver, node: ^Node) {
+    imp := &node.data.(Node_Import)
+    mod := load_module(imp.path, node.pos)
+    imp.module = mod
+
+    fs := r.current.function_scope
+    for &n in imp.names {
+        exported, ok := mod.decs.exports[n.name]
+        if !ok {
+            highlight_lines(n.pos)
+            panicf("module \"%s\" has no export \"%s\"", imp.path, n.name)
+        }
+
+        existing: ^Symbol = nil
+        for s in fs.symbols {
+            if s.name == n.name {
+                existing = s
+                break
+            }
+        }
+
+        sym: ^Symbol
+        if existing != nil {
+            if existing.imported {
+                highlight_lines(n.pos)
+                panicf("name \"%s\" is imported more than once", n.name)
+            }
+            sym = existing
+        } else {
+            sym = declare_symbol(r, n.name)
+        }
+        sym.imported = true
+        sym.defined = true
+        n.resolved = sym
+        n.exported = exported
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -315,9 +381,13 @@ resolve_assign_target :: proc(r: ^Resolver, node: ^Node) -> ^Symbol {
 // interpreter.odin's builtins_registry) -- it just reserves the
 // names, the same way it would for anything else predeclared ahead
 // of user code.
+//
+// exports maps each name declared with "export x = ..." to its Symbol,
+// so a module that imports this one can find the right Cell.
 ModuleDecs :: struct {
     num_slots: int,
     builtins:  map[string]^Symbol,
+    exports:   map[string]^Symbol,
 }
 
 resolve_module_ast :: proc(ast: ^AST, builtin_names: []string) -> ModuleDecs {
@@ -336,6 +406,16 @@ resolve_module_ast :: proc(ast: ^AST, builtin_names: []string) -> ModuleDecs {
         builtins[name] = sym
     }
 
+    // Imports are hoisted: every one is resolved before anything else
+    // in the module, regardless of where it appears among the
+    // top-level statements. (Imports nested inside a block or function
+    // are rejected later, in resolve_stmt.)
+    for stmt in ast.nodes {
+        if stmt.kind == .Import {
+            resolve_import(&r, stmt)
+        }
+    }
+
     for stmt in ast.nodes {
         predeclare_names(&r, stmt)
     }
@@ -343,17 +423,47 @@ resolve_module_ast :: proc(ast: ^AST, builtin_names: []string) -> ModuleDecs {
         resolve_stmt(&r, stmt)
     }
 
+    // Only top-level "export x = ..." statements get here -- anywhere
+    // else resolve_stmt already rejected them. (The parser guarantees
+    // an exported target is a plain Name.)
+    exports := make(map[string]^Symbol)
+    for stmt in ast.nodes {
+        if stmt.kind == .Assign {
+            a := &stmt.data.(Node_Assign)
+            if a.exported {
+                sym := a.target.data.(Node_Name).resolved
+                exports[sym.name] = sym
+            }
+        }
+    }
+
     fs := r.current.function_scope
     num_slots := fs.next_slot^
 
     exit_scope(&r)
-    return ModuleDecs{num_slots = num_slots, builtins = builtins}
+    return ModuleDecs{num_slots = num_slots, builtins = builtins, exports = exports}
 }
 
 resolve_stmt :: proc(r: ^Resolver, node: ^Node) {
     #partial switch node.kind {
     case .Assign:
         a := &node.data.(Node_Assign)
+
+        // At module top level r.current is the global Function scope;
+        // inside any block or function it's something else.
+        if a.exported && (r.current.kind != .Function || r.current.owning_fn != nil) {
+            highlight_lines(node.pos)
+            panicf("\"export\" is only allowed at the top level of a module")
+        }
+
+        // "a.b = v" / "a[i] = v": nothing is declared. The target
+        // expression (object + index) is resolved like any other
+        // read, so "a" must already exist and be defined.
+        if a.target.kind != .Name {
+            resolve_expr(r, a.target)
+            resolve_expr(r, a.value)
+            return
+        }
 
         // The target is already a known LOCAL symbol (declared, not
         // yet defined) by this point -- predeclare_names hoisted it
@@ -394,6 +504,15 @@ resolve_stmt :: proc(r: ^Resolver, node: ^Node) {
 
     case .Block:
         resolve_block(r, node)
+
+    case .Import:
+        // Top-level imports were already fully handled up front in
+        // resolve_module_ast. Reaching one anywhere else means it's
+        // nested inside a block or function.
+        if r.current.kind != .Function || r.current.owning_fn != nil {
+            highlight_lines(node.pos)
+            panicf("imports are only allowed at the top level of a module")
+        }
 
     // TODO: .If, .While once parse_stmt actually produces them.
 
@@ -449,6 +568,15 @@ resolve_expr :: proc(r: ^Resolver, node: ^Node) {
         for f in obj.fields {
             resolve_expr(r, f.value)
         }
+
+    case .Field:
+        f := &node.data.(Node_Field)
+        resolve_expr(r, f.object)
+
+    case .Index:
+        i := &node.data.(Node_Index)
+        resolve_expr(r, i.object)
+        resolve_expr(r, i.index)
 
     case .Function:
         resolve_function(r, node)

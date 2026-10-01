@@ -1,13 +1,14 @@
-fn = (a) {
-    return a(3);
-}
+import { fn } from "./a.fio";
 smth = () {
-
     b = 3;
     f = (a) => b + 3*b;
-    print(fn(f))
+    print(fn(f(2)))
 
 }
 smth()
-a = {x=123};
-print(a);
+print(fn(4));
+v = exec("echo", "\"Hello, World from echo!\"")
+print(v.stdout);
+print(json_marshall(v));
+print("He" + "llo"+ "!");
+print(string(123));

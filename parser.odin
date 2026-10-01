@@ -40,10 +40,14 @@ Node_Kind :: enum {
     Array,
     Object,
 
+    Field,
+    Index,
+
     If,
     While,
     Return,
     Block,
+    Import,
 }
 
 Node :: struct {
@@ -61,9 +65,12 @@ Node :: struct {
         Node_Function,
         Node_Array,
         Node_Object,
+        Node_Field,
+        Node_Index,
         Node_If,
         Node_Return,
         Node_Block,
+        Node_Import,
     },
 }
 
@@ -106,10 +113,18 @@ Node_Unary :: struct {
     expr: ^Node,
 }
 
+// exported is set by "export x = ..." (plain assignments only). The
+// resolver only allows it at a module's top level, and collects every
+// exported target into ModuleDecs.exports.
+//
+// target is a .Name, .Field or .Index node. Only .Name can be
+// exported or declare a variable; .Field / .Index store into an
+// existing object or array.
 Node_Assign :: struct {
-    target: ^Node,
-    value:  ^Node,
-    op:     Maybe(BinopKind),
+    target:   ^Node,
+    value:    ^Node,
+    op:       Maybe(BinopKind),
+    exported: bool,
 }
 
 // name is nil for a positional argument ("f(1, 2)"), and set for a
@@ -164,6 +179,18 @@ Node_Object :: struct {
     fields: []Node_Object_Field,
 }
 
+// object.name
+Node_Field :: struct {
+    object: ^Node,
+    name:   string,
+}
+
+// object[index]
+Node_Index :: struct {
+    object: ^Node,
+    index:  ^Node,
+}
+
 Node_If :: struct {
     condition:   ^Node,
     then_body:   ^Node,
@@ -172,6 +199,27 @@ Node_If :: struct {
 
 Node_Block :: struct {
     statements: []^Node,
+}
+
+// One name in "import { a, b } from ...". resolved and exported are
+// filled in by the resolver: resolved is the importing module's own
+// local Symbol for the name, exported is the Symbol it aliases inside
+// the imported module (the interpreter points the former's storage at
+// the latter's).
+Node_Import_Name :: struct {
+    name:     string,
+    pos:      Span,
+    resolved: ^Symbol,
+    exported: ^Symbol,
+}
+
+// path is the string exactly as written in the source (unescaped, no
+// quotes); the resolver turns it into a real file (relative to the
+// importing file, or under get_fio_internal_path()) and fills in module.
+Node_Import :: struct {
+    path:   string,
+    names:  []Node_Import_Name,
+    module: ^Module,
 }
 
 Parser :: struct {
@@ -298,19 +346,48 @@ is_kw :: proc(t: Token, k: Keyword) -> bool {
     return false
 }
 
-// Eats a trailing ";" if present. Semicolons are optional in this
-// grammar, so this is never required -- just consumed when present.
-maybe_consume_semicolon :: proc(p: ^Parser) {
-    if is_symbol(current_token(p), ";") {
+// "from" is matched as a plain identifier by its text, so the lexer
+// doesn't need to know about it. If you later make it a real keyword,
+// swap the call site over to is_kw.
+is_ident_text :: proc(t: Token, s: string) -> bool {
+    if t.kind == .Ident && t.text == s { return true }
+    return false
+}
+
+// True if this token is the first one on its line. This is the only
+// place that knows how newlines are represented (Token.newline_before,
+// set by the lexer).
+starts_new_line :: proc(t: Token) -> bool {
+    return t.newline_before
+}
+
+// A statement ends at ";", at a newline, or right before "}" / EOF
+// (so "{ x = 1 }" on one line still works). Anything else means two
+// statements were jammed together on one line.
+end_stmt :: proc(p: ^Parser) {
+    t := current_token(p)
+    if is_symbol(t, ";") {
         advance_token(p)
+        return
     }
+    if starts_new_line(t) || is_symbol(t, "}") || is_at_end(p) {
+        return
+    }
+    highlight_lines(t.span)
+    panicf("parse error: expected \";\" or newline at end of statement, got \"%s\"", t.text)
 }
 
 // ---------------------------------------------------------------------
 // Operator tables
 // ---------------------------------------------------------------------
 
+// These all require kind == .Symbol: a string literal's text is its
+// unquoted contents, so a literal like "+" must never be mistaken for
+// the operator.
 op_kind :: proc(t: Token) -> (kind: BinopKind, ok: bool) {
+    if t.kind != .Symbol {
+        return {}, false
+    }
     switch t.text {
     case "+":  return .Addition,     true
     case "-":  return .Subtraction,  true
@@ -333,6 +410,9 @@ op_kind :: proc(t: Token) -> (kind: BinopKind, ok: bool) {
 }
 
 op_precedence :: proc(t: Token) -> int {
+    if t.kind != .Symbol {
+        return -1
+    }
     switch t.text {
     case "||":
         return 1
@@ -361,6 +441,9 @@ op_is_right_assoc :: proc(t: Token) -> bool {
 // Maps a compound-assignment token ("+=", "-=", ...) to the BinopKind
 // it desugars to. `target += value` becomes `target = target + value`.
 compound_assign_op :: proc(t: Token) -> (kind: BinopKind, ok: bool) {
+    if t.kind != .Symbol {
+        return {}, false
+    }
     switch t.text {
     case "+=": return .Addition,    true
     case "-=": return .Subtraction, true
@@ -378,29 +461,96 @@ compound_assign_op :: proc(t: Token) -> (kind: BinopKind, ok: bool) {
 // Statements
 // ---------------------------------------------------------------------
 
-// Only .Name is a valid assignment target for now. Once field access
-// and indexing exist as expression nodes, add their kinds here.
+// A name, a field access (a.b) or an index (a[i]) can be assigned to.
 is_assignable_target :: proc(n: ^Node) -> bool {
-    return n.kind == .Name
+    return n.kind == .Name || n.kind == .Field || n.kind == .Index
+}
+
+// import { a, b, c } from "path/to/file.fio"
+// Parsed anywhere a statement can appear; the resolver is what
+// rejects imports that aren't at a module's top level.
+parse_import :: proc(p: ^Parser) -> ^Node {
+    kw := advance_token(p) // "import"
+    expect_symbol(p, "{")
+
+    names := make([dynamic]Node_Import_Name, context.temp_allocator)
+    for !is_symbol(current_token(p), "}") {
+        name := current_token(p)
+        if name.kind != .Ident {
+            highlight_lines(name.span)
+            panicf("parse error: expected imported name, got %v", name.kind)
+        }
+        advance_token(p)
+        append(&names, Node_Import_Name{name = name.text, pos = name.span})
+
+        if is_symbol(current_token(p), ",") {
+            advance_token(p)
+        } else {
+            break
+        }
+    }
+    expect_symbol(p, "}")
+
+    from := current_token(p)
+    if !is_ident_text(from, "from") {
+        highlight_lines(from.span)
+        panicf("parse error: expected \"from\" after import list, got \"%s\"", from.text)
+    }
+    advance_token(p) // "from"
+
+    path_tok := expect_token(p, .String)
+    end_stmt(p)
+
+    node := new_node(p, .Import)
+    node.pos = kw.span
+    node.data = Node_Import{path = path_tok.text, names = names[:]}
+    return node
 }
 
 parse_stmt :: proc(p: ^Parser) -> ^Node {
+    if is_kw(current_token(p), .Import) && is_symbol(peek_token(p), "{") {
+        return parse_import(p)
+    }
+
+    // "export x = ..." -- only when an identifier follows, so a plain
+    // variable that happens to be named "export" still works.
+    if is_kw(current_token(p), .Export) && peek_token(p).kind == .Ident {
+        export_tok := advance_token(p) // "export"
+        stmt := parse_stmt(p)
+        if stmt.kind != .Assign {
+            highlight_lines(export_tok.span)
+            panicf("parse error: \"export\" must be followed by an assignment")
+        }
+        a := &stmt.data.(Node_Assign)
+        if a.target.kind != .Name {
+            highlight_lines(export_tok.span)
+            panicf("parse error: \"export\" needs a plain variable name, not a field or index")
+        }
+        if _, has_op := a.op.?; has_op {
+            highlight_lines(export_tok.span)
+            panicf("parse error: \"export\" can't be used with a compound assignment")
+        }
+        a.exported = true
+        return stmt
+    }
+
     if is_kw(current_token(p), .Return) {
         tok := advance_token(p) // "return"
 
         node := new_node(p, .Return)
         node.pos = tok.span
 
-        // Bare "return;" / "return" at end of block -- no value.
-        if is_symbol(current_token(p), ";") || is_symbol(current_token(p), "}") || is_at_end(p) {
+        // Bare "return" -- followed by ";", "}", EOF, or a newline.
+        cur := current_token(p)
+        if is_symbol(cur, ";") || is_symbol(cur, "}") || is_at_end(p) || starts_new_line(cur) {
             node.data = Node_Return{value = nil}
-            maybe_consume_semicolon(p)
+            end_stmt(p)
             return node
         }
 
         value := parse_expr(p) // "return [1, 2]" is just an array-literal value here
         node.data = Node_Return{value = value}
-        maybe_consume_semicolon(p)
+        end_stmt(p)
         return node
     }
 
@@ -416,7 +566,7 @@ parse_stmt :: proc(p: ^Parser) -> ^Node {
         node := new_node(p, .Assign)
         node.pos = expr.pos
         node.data = Node_Assign{target = expr, value = value, op = nil}
-        maybe_consume_semicolon(p)
+        end_stmt(p)
         return node
     }
 
@@ -430,11 +580,11 @@ parse_stmt :: proc(p: ^Parser) -> ^Node {
         node := new_node(p, .Assign)
         node.pos = expr.pos
         node.data = Node_Assign{target = expr, value = value, op = kind}
-        maybe_consume_semicolon(p)
+        end_stmt(p)
         return node
     }
 
-    maybe_consume_semicolon(p)
+    end_stmt(p)
     return expr
 }
 
@@ -453,6 +603,7 @@ parse_binop :: proc(p: ^Parser, min_prec: int) -> ^Node {
         op := current_token(p)
         prec := op_precedence(op)
         if prec < min_prec { break }
+        if starts_new_line(op) { break } // a newline ends the expression
 
         advance_token(p)
 
@@ -488,11 +639,17 @@ parse_unary :: proc(p: ^Parser) -> ^Node {
     return parse_postfix(p)
 }
 
+// Postfix operators chain left to right: calls f(...), field access
+// a.b, and indexing a[i], so "a.b[0].c(1)" parses as expected.
+// "(" and "[" at the start of a line begin a new statement instead of
+// continuing the previous expression; "." may start a line so chains
+// can wrap.
 parse_postfix :: proc(p: ^Parser) -> ^Node {
     t := parse_primary(p)
 
     for {
-        if is_symbol(current_token(p), "(") {
+        cur := current_token(p)
+        if is_symbol(cur, "(") && !starts_new_line(cur) {
             advance_token(p) // "("
             args := make([dynamic]Node_Arg, context.temp_allocator)
             for !is_symbol(current_token(p), ")") {
@@ -522,12 +679,28 @@ parse_postfix :: proc(p: ^Parser) -> ^Node {
             node.pos = t.pos
             node.data = Node_Call{function = t, args = args[:]}
             t = node
-        } else if is_symbol(current_token(p), ".") {
-            // TODO: field access node once you settle the field-access AST shape
-            break
-        } else if is_symbol(current_token(p), "[") {
-            // TODO: index node once you settle the index AST shape
-            break
+        } else if is_symbol(cur, ".") {
+            advance_token(p) // "."
+            name := current_token(p)
+            if name.kind != .Ident {
+                highlight_lines(name.span)
+                panicf("parse error: expected field name after \".\", got %v", name.kind)
+            }
+            advance_token(p)
+
+            node := new_node(p, .Field)
+            node.pos = t.pos
+            node.data = Node_Field{object = t, name = name.text}
+            t = node
+        } else if is_symbol(cur, "[") && !starts_new_line(cur) {
+            advance_token(p) // "["
+            index := parse_expr(p)
+            expect_symbol(p, "]")
+
+            node := new_node(p, .Index)
+            node.pos = t.pos
+            node.data = Node_Index{object = t, index = index}
+            t = node
         } else {
             break
         }

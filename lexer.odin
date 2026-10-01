@@ -29,13 +29,19 @@ Keyword :: enum {
     Break,
     Continue,
     Import,
+    Export,
 }
 
 Token :: struct {
     span: Span,
     kind: TokenKind,
+    // For .String this is the UNESCAPED contents, without quotes.
     text: string,
     kw: Keyword,
+    // True if a newline (or the start of the file) came between the
+    // previous token and this one. The parser uses this to end
+    // statements without requiring ";".
+    newline_before: bool,
 }
 
 is_alpha :: proc(c: byte) -> bool {
@@ -61,31 +67,70 @@ hex_digit_val :: proc(c: byte) -> int {
     case: return -1
     }
 }
+
+// True if buf[i], buf[i+1] form one of the two-character symbols.
+// Bounds-checked: returns false when i is the last byte.
+is_two_char_symbol :: proc(buf: []byte, i: int) -> bool {
+    if i + 1 >= len(buf) {
+        return false
+    }
+    a := buf[i]
+    b := buf[i+1]
+    return (a == '=' && b == '>') || // "=>" functions
+           (a == '<' && b == '=') ||
+           (a == '>' && b == '=') ||
+           (a == '!' && b == '=') ||
+           (a == '=' && b == '=') ||
+           (a == '|' && b == '|') ||
+           (a == '&' && b == '&') ||
+           (a == '+' && b == '=') ||
+           (a == '-' && b == '=') ||
+           (a == '*' && b == '=') ||
+           (a == '/' && b == '=') ||
+           (a == '&' && b == '=') ||
+           (a == '|' && b == '=') ||
+           (a == '~' && b == '=') ||
+           (a == '%' && b == '=')
+}
+
 lex_file :: proc(buf: []byte) -> [dynamic]Token {
     tokens := make([dynamic]Token)
     i := 0
+
+    // Newline tracking: saw_newline is set whenever skipped whitespace
+    // or a comment contained a '\n', and consumed by the next token
+    // emitted. Starts true so the first token of a file counts as being
+    // at the start of a line.
+    saw_newline := true
+
     for i < len(buf) {
+        count_before := len(tokens)
         c := buf[i]
         if is_space(c) {
+            if c == '\n' {
+                saw_newline = true
+            }
             i += 1
-            } else if c == '/' && i + 1 < len(buf) && buf[i+1] == '/' {
-            // line comment: skip to end of line
+        } else if c == '/' && i + 1 < len(buf) && buf[i+1] == '/' {
+            // line comment: skip to end of line (the '\n' itself is
+            // left for the whitespace branch, which records it)
             i += 2
             for i < len(buf) && buf[i] != '\n' {
                 i += 1
             }
         } else if c == '/' && i + 1 < len(buf) && buf[i+1] == '*' {
             // block comment: skip to closing */
-            start := i
             i += 2
             for i + 1 < len(buf) && !(buf[i] == '*' && buf[i+1] == '/') {
+                if buf[i] == '\n' {
+                    saw_newline = true
+                }
                 i += 1
             }
             if i + 1 < len(buf) {
                 i += 2 // consume the closing */
             } else {
                 panic("unterminated block comment")
-                // i = len(buf)
             }
         } else if is_num(c) {
             start := i
@@ -175,6 +220,12 @@ lex_file :: proc(buf: []byte) -> [dynamic]Token {
                     kind = .Keyword,
                     kw   = .Import,
                 })
+            }else if ident == "export" {
+                append(&tokens, Token{
+                    span = Span{start, i},
+                    kind = .Keyword,
+                    kw   = .Export,
+                })
             }else if ident == "cast" {
                 append(&tokens, Token{
                     span = Span{start, i},
@@ -206,7 +257,7 @@ lex_file :: proc(buf: []byte) -> [dynamic]Token {
                     text = ident,
                 })
             }
-            } else if c == '"' {
+        } else if c == '"' {
             start := i
             i += 1 // consume opening quote
 
@@ -270,28 +321,15 @@ lex_file :: proc(buf: []byte) -> [dynamic]Token {
                 i += 1 // consume closing quote
             }
 
+            // text is the unescaped contents (no quotes); span still
+            // covers the whole literal including quotes.
             append(&tokens, Token{
                 span = Span{start, i},
                 kind = .String,
-                text = cast(string)buf[start:i],
+                text = string(out[:]),
             })
         } else {
-            if  buf[i] == '=' && buf[i+1] == '>' || // "=>" functions
-                buf[i] == '<' && buf[i+1] == '=' ||
-                buf[i] == '>' && buf[i+1] == '=' ||
-                buf[i] == '!' && buf[i+1] == '=' ||
-                buf[i] == '=' && buf[i+1] == '=' ||
-                buf[i] == '|' && buf[i+1] == '|' ||
-                buf[i] == '&' && buf[i+1] == '&' ||
-                buf[i] == '+' && buf[i+1] == '=' ||
-                buf[i] == '-' && buf[i+1] == '=' ||
-                buf[i] == '*' && buf[i+1] == '=' ||
-                buf[i] == '/' && buf[i+1] == '=' ||
-                buf[i] == '&' && buf[i+1] == '=' ||
-                buf[i] == '|' && buf[i+1] == '=' ||
-                buf[i] == '~' && buf[i+1] == '=' ||
-                buf[i] == '%' && buf[i+1] == '='
-                {
+            if is_two_char_symbol(buf, i) {
                 append(&tokens, Token{
                     span = Span{i, i + 2},
                     kind = .Symbol,
@@ -308,8 +346,14 @@ lex_file :: proc(buf: []byte) -> [dynamic]Token {
                 i += 1
             }
         }
+
+        // If this iteration produced a token, stamp it with whether a
+        // newline preceded it, then reset the flag.
+        if len(tokens) > count_before {
+            tokens[count_before].newline_before = saw_newline
+            saw_newline = false
+        }
     }
-    append(&tokens, Token{kind=.EOF})
+    append(&tokens, Token{kind = .EOF, newline_before = true})
     return tokens
 }
-

@@ -24,7 +24,7 @@ init_context :: proc() -> ^Context {
 
     ctx.files = make(map[string]string, allocator = al)
 
-    ctx.debug = true
+    ctx.debug = false
     return ctx
 }
 destroy_context :: proc(ctx: ^Context) {
@@ -36,34 +36,36 @@ destroy_context :: proc(ctx: ^Context) {
 
 handle_file :: proc(file_name: string) {
     ctx := get_ctx()
-    data, err := os.read_entire_file(file_name, ctx.allocator)
+
+    // Normalized so the entry file has the same module key an import
+    // of it would produce (this is what catches "a imports main").
+    path := normalize_path(file_name)
+
+    data, err := os.read_entire_file(path, ctx.allocator)
     if err != io.Error.None {
         panic("Failed to read file")
     }
-    ctx.files[file_name] = string(data)
-    ctx.current_file = file_name
 
     debugln("file size:", len(data));
 
-    tokens := lex_file(data)
-    defer delete(tokens)
-
-    debugln("PARSING FILE");
-    ast := parse_tokens(string(data), tokens[:])
-
-    debugln("RESOLVING SYMBOLS");
-    // builtin_names() reads off interpreter.odin's builtins_registry
-    // -- "print", "len", "type_of", and anything else registered
-    // there -- so this list never needs editing by hand here again.
-    decs := resolve_module_ast(&ast, builtin_names())
+    // Lexes, parses and resolves the file, recursively loading
+    // everything it imports.
+    mod := load_module_source(path, data)
+    ctx.current_file = path
 
     debugln("RUNNING");
-    run_program(&ast, decs)
+    run_module(mod)
 }
 
 
 main :: proc() {
+    // os.args[0] is the program name, os.args[1] is the first real argument
+    if len(os.args) < 2 {
+        panicf("usage: %s <file.fio>", os.args[0])
+    }
+    file_name := os.args[1]
+
     context.user_ptr = cast(rawptr)init_context()
-    handle_file("example.fio")
+    handle_file(file_name)
     destroy_context(get_ctx())
 }
